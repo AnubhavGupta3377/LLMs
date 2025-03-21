@@ -1,3 +1,5 @@
+"""model.py"""
+
 '''
 References:
 
@@ -7,7 +9,7 @@ Andrej Karpathy's video: https://www.youtube.com/watch?v=l8pRSuU81PU&list=PLAqhI
 import math
 import torch
 from torch.nn import functional as F
-from config import GPTConfig
+from utils import GPTConfig
 
 class MaskedMultiheadSelfAttentionBlock(torch.nn.Module):
     def __init__(self, config):
@@ -22,6 +24,7 @@ class MaskedMultiheadSelfAttentionBlock(torch.nn.Module):
         self.n_embed = config.n_embed
 
     def forward(self, x):
+        device = x.device
         batch_size, seq_len, embed_dim = x.size()
 
         # Calculate query, key and value vectors for the batches
@@ -33,13 +36,17 @@ class MaskedMultiheadSelfAttentionBlock(torch.nn.Module):
         k = k.view(batch_size, seq_len, self.n_head, embed_dim//self.n_head).transpose(1, 2) #(batch_size, n_head, seq_len, embed_dim/n_head)
         v = v.view(batch_size, seq_len, self.n_head, embed_dim//self.n_head).transpose(1, 2) #(batch_size, n_head, seq_len, embed_dim/n_head)
         
-        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
-        mask = mask.bool().view(1, 1, seq_len, seq_len)
-        attention_scores = (q @ k.transpose(2,3)) / (math.sqrt(q.size(-1))) # (batch_size, n_head, seq_len, seq_len)
-        attention_scores = attention_scores.masked_fill(mask, float('-inf'))
-        attention_scores = F.softmax(attention_scores, dim=-1)
+        # # Implementation of attention
+        # mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).to(device)
+        # mask = mask.bool().view(1, 1, seq_len, seq_len)
+        # attention_scores = (q @ k.transpose(2,3)) / (math.sqrt(q.size(-1))) # (batch_size, n_head, seq_len, seq_len)
+        # attention_scores = attention_scores.masked_fill(mask, float('-inf'))
+        # attention_scores = F.softmax(attention_scores, dim=-1)
+        # output = attention_scores @ v # (batch_size, n_head, seq_len, embed_dim/n_head)
 
-        output = attention_scores @ v # (batch_size, n_head, seq_len, embed_dim/n_head)
+        # Flash attention
+        output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         output = output.transpose(1, 2) # (batch_size, seq_len, n_head, embed_dim/n_head)
         output = output.reshape(batch_size, seq_len, self.n_embed)
         output = self.c_proj(output)
@@ -94,12 +101,28 @@ class GPT(torch.nn.Module):
             ln_f = torch.nn.LayerNorm(config.n_embed)
         ))
         self.lm_head = torch.nn.Linear(config.n_embed, config.vocab_size, bias=False)
+
+        # Weight sharing between token embeddings and final linear layer
+        self.lm_head.weight = self.transformer.wte.weight
+
+        # Parameter initialization
+        self.apply(self._init_weights)
     
-    def forward(self, idx):
+    def _init_weights(self, module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)): # GPT2 has std=0.1 for Embedding modules
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        if isinstance(module, torch.nn.LayerNorm): # Same as pytorch default
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
         batch_size, seq_len = idx.size()
         assert seq_len <= self.config.block_size
 
-        positions = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
+        positions = torch.arange(0, seq_len, dtype=torch.long, device=device)
         pos_embed = self.transformer.wpe(positions) # (batch_size, seq_len)
         tok_embed = self.transformer.wte(idx) # (batch_size, seq_len, n_embed)
         x = tok_embed + pos_embed
@@ -107,7 +130,11 @@ class GPT(torch.nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (batch_size, seq_len, vocab_size)
-        return logits
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
