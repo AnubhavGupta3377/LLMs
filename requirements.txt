@@ -4,3 +4,4 @@ transformers
 tiktoken
 datasets
 triton
+accelerate

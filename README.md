@@ -9,3 +9,5 @@ It contains following code implementations:
     - GPT2 model architecture
     - Loading pre-trained GPT2 weights
     - Code for generation
+
+Uses [Accelerate](https://huggingface.co/docs/accelerate/en/index) for distributed training.

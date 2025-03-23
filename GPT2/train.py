@@ -1,59 +1,83 @@
 import torch
 import time
-import torch.optim as optim
 import math
-from utils import GPTConfig, TrainConfig, DataLoader
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from utils import GPTConfig, TrainConfig, ShakespeareDataset
+from torch.utils.data import DataLoader
 from model import GPT
+from transformers import get_cosine_schedule_with_warmup
 
-
-def get_lr(warmup_steps, max_steps, max_lr, min_lr, current_step):
-    if current_step < warmup_steps:
-        return max_lr * float(current_step + 1) / warmup_steps
-    if current_step >= max_steps:
-        return min_lr
-
-    decay_ratio = (current_step - warmup_steps) / (max_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
-    
-
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-print(f"Using device: {device}")
 
 # Random seed for reproducibility
-torch.manual_seed(3377)
-torch.cuda.manual_seed(3377)
+seed = 3377
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+set_seed(seed)
 
-## Use TF32 precision for matrix multiplications
-# torch.set_float32_matmul_precision("high")
+# Initialize accelerator
+accelerator = Accelerator(mixed_precision="fp16")
+device = accelerator.device
+print(f"Using device: {device}")
 
-train_loader = DataLoader(batch_size=16, block_size=256)
 config = GPTConfig(vocab_size=50304) # Make vocab size a "nice" number by adding dummy vocab tokens
 model = GPT(config)
-model.to(device)
-# model = torch.compile(model) # Always compile model for faster training time
+# model = torch.compile(model) # Always compile model for faster training time (at least without accelerate)
 
 train_config = TrainConfig()
-optimizer = torch.optim.AdamW(model.parameters(), betas=(train_config.adam_beta1, train_config.adam_beta2), eps=train_config.adam_epsilon)
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=train_config.max_lr,
+    betas=(train_config.adam_beta1, train_config.adam_beta2),
+    eps=train_config.adam_epsilon,
+    weight_decay=0.1
+    )
+
+train_dataset = ShakespeareDataset(batch_size=train_config.batch_size, block_size=config.block_size, accelerator=accelerator)
+train_loader = DataLoader(train_dataset, batch_size=train_config.batch_size)
+grad_accum_steps = train_config.effective_batch_size // (train_config.batch_size * config.block_size)
+num_steps = train_config.num_epochs * len(train_loader) // grad_accum_steps
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_config.warmup_steps, num_training_steps=num_steps)
+
+model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
+accelerator.save_state(f"training/Checkpoints/step_0")
+
+accelerator.print("Starting training")
+accelerator.print(f"Epochs: {train_config.num_epochs}")
+accelerator.print(f"Total training steps: {num_steps}")
+accelerator.print(f"Total batch size: {train_config.effective_batch_size}")
+accelerator.print(f"Gradient accumulation steps: {grad_accum_steps}")
+
 # Training loop
-for step in range(train_config.training_steps):
+for epoch in range(train_config.num_epochs):
     start_time = time.time()
-    x, y = train_loader.get_next_batch()
-    x, y = x.to(device), y.to(device)
-
     optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    step_loss = 0.0
 
-    learning_rate = get_lr(warmup_steps=train_config.warmup_steps, max_steps=train_config.max_steps, max_lr=train_config.max_lr, min_lr=train_config.max_lr * 0.1, current_step=step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = learning_rate
-    optimizer.step()
+    for idx, batch in enumerate(train_loader):
+        x, y = batch
+        step_count = epoch * len(train_loader) + idx + 1
+        with accelerator.autocast():
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        step_loss += loss.detach().item()
+        accelerator.backward(loss)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
+
+        if (idx + 1) % grad_accum_steps == 0:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+        
+            torch.cuda.synchronize()
+            end_time = time.time()
+            runtime = (end_time - start_time) * 1000
+
+            # Gather metrics from all processes
+            gathered_loss = accelerator.gather(torch.tensor(step_loss).to(device)).mean().item()
+            gathered_step_time = accelerator.gather(torch.tensor(runtime).to(device)).mean().item()
+            step_loss = 0.0
+            start_time = time.time()
+            accelerator.print(f"Step {step_count // grad_accum_steps} | Loss: {gathered_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Grad Norm: {norm:.4f} | Time: {gathered_step_time:.2f} ms | tok/sec/gpu: {train_config.effective_batch_size * 1000 / gathered_step_time:.2f}")
     
-    torch.cuda.synchronize()
-    end_time = time.time()
-    runtime = (end_time - start_time) * 1000
-    print(f"Step {step} | Loss: {loss.item():.6f} | LR: {learning_rate:.6f} | Grad Norm: {norm:.4f} | Time: {runtime:.2f} ms | tok/sec: {x.size(0) * x.size(1) / runtime:.2f}")
+    accelerator.save_state(f"training/Checkpoints/epoch_{epoch}")
