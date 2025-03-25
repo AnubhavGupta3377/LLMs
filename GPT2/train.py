@@ -11,12 +11,10 @@ from transformers import get_cosine_schedule_with_warmup
 
 # Random seed for reproducibility
 seed = 3377
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
 set_seed(seed)
 
 # Initialize accelerator
-accelerator = Accelerator(mixed_precision="fp16")
+accelerator = Accelerator(mixed_precision="fp16", step_scheduler_with_optimizer=False)
 device = accelerator.device
 print(f"Using device: {device}")
 
@@ -33,14 +31,13 @@ optimizer = torch.optim.AdamW(
     weight_decay=0.1
     )
 
-train_dataset = ShakespeareDataset(batch_size=train_config.batch_size, block_size=config.block_size, accelerator=accelerator)
+train_dataset = ShakespeareDataset(block_size=config.block_size, accelerator=accelerator)
 train_loader = DataLoader(train_dataset, batch_size=train_config.batch_size)
-grad_accum_steps = train_config.effective_batch_size // (train_config.batch_size * config.block_size)
-num_steps = train_config.num_epochs * len(train_loader) // grad_accum_steps
-scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_config.warmup_steps, num_training_steps=num_steps)
+grad_accum_steps = train_config.effective_batch_size // (train_config.batch_size * config.block_size * accelerator.num_processes)
+num_steps = train_config.num_epochs * len(train_loader) // (grad_accum_steps * accelerator.num_processes)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_config.warmup_steps, num_training_steps=num_steps * 1.5)
 
 model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
-accelerator.save_state(f"training/Checkpoints/step_0")
 
 accelerator.print("Starting training")
 accelerator.print(f"Epochs: {train_config.num_epochs}")
@@ -72,12 +69,16 @@ for epoch in range(train_config.num_epochs):
             torch.cuda.synchronize()
             end_time = time.time()
             runtime = (end_time - start_time) * 1000
+            final_loss = step_loss
 
             # Gather metrics from all processes
-            gathered_loss = accelerator.gather(torch.tensor(step_loss).to(device)).mean().item()
+            gathered_loss = accelerator.gather(torch.tensor(final_loss).to(device)).mean().item()
             gathered_step_time = accelerator.gather(torch.tensor(runtime).to(device)).mean().item()
             step_loss = 0.0
             start_time = time.time()
-            accelerator.print(f"Step {step_count // grad_accum_steps} | Loss: {gathered_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Grad Norm: {norm:.4f} | Time: {gathered_step_time:.2f} ms | tok/sec/gpu: {train_config.effective_batch_size * 1000 / gathered_step_time:.2f}")
+            accelerator.print(f"Step {step_count // grad_accum_steps} | Loss: {gathered_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.6f} | Grad Norm: {norm:.4f} | Time: {gathered_step_time:.2f} ms | tok/sec: {train_config.effective_batch_size * 1000 / gathered_step_time:.2f}")
     
     accelerator.save_state(f"training/Checkpoints/epoch_{epoch}")
+
+if torch.distributed.is_initialized():
+    torch.distributed.destroy_process_group()

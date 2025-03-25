@@ -19,15 +19,14 @@ class TrainConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     warmup_steps: int = 10 # Number of warmup steps for lr scheduler
-    max_lr: float = 6e-4 # Maximum learning rate
-    num_epochs: int = 5 # Number of training steps
+    max_lr: float = 1e-3 # Maximum learning rate
+    num_epochs: int = 15 # Number of training steps
     batch_size: int = 16
     effective_batch_size: int = 2**15 # 32k (For gradient accumulation)
 
 
 class ShakespeareDataset(Dataset):
-    def __init__(self, batch_size, block_size, accelerator=None):
-        self.batch_size = batch_size
+    def __init__(self, block_size, accelerator=None):
         self.block_size = block_size
 
         with open("dataset/input.txt", "r") as f:
@@ -43,8 +42,8 @@ class ShakespeareDataset(Dataset):
         
         print_func = print if accelerator is None else accelerator.print
         print_func(f"Loaded {len(self.tokens)} tokens")
-        print_func(f"Number of batches per epoch: {len(self.tokens) // (batch_size * block_size)}")
         print_func(f"Number of samples (with block_size = {block_size}): {num_samples}")
+        print_func()
 
     def __len__(self):
         return len(self.inputs)
