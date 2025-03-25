@@ -2,16 +2,27 @@ import torch
 from model import GPT
 import tiktoken
 from torch.nn import functional as F
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from utils import GPTConfig
 
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
+def load_model(checkpoint_path=None):
+    config = GPTConfig(vocab_size=50304) # Make vocab size a "nice" number by adding dummy vocab tokens
+    model = GPT(config)
+    model = accelerator.prepare(model)
+    if checkpoint_path is not None:
+        accelerator.load_state(checkpoint_path)
+    return model
 
-model = GPT.from_pretrained("gpt2")
+accelerator = Accelerator(mixed_precision="fp16")
+device = accelerator.device
+seed = 3377
+set_seed(seed)
+
+model = load_model()
 model.eval()
-model.to(device)
-print("Loaded")
+print("Loaded model")
 
 encoder = tiktoken.get_encoding("gpt2")
 text = "Hello, I'm a language model,"
@@ -22,10 +33,7 @@ tokens = tokens.unsqueeze(0).repeat(5, 1) # Repeat the tensor 5 times
 x = tokens.to(device)
 
 # Generate text
-random_seed = 42
 max_length = 30
-torch.manual_seed(random_seed)
-torch.cuda.manual_seed(random_seed)
 while x.size(1) < max_length:
     with torch.no_grad():
         logits, _ = model(x)
