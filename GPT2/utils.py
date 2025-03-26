@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256      # max seq length
+    block_size: int = 1024      # max seq length
     vocab_size: int = 50257     # vocabulary
     n_layer: int = 12          # number of transformer layers
     n_embed: int = 768          # embedding dimension
@@ -20,7 +20,7 @@ class TrainConfig:
     adam_beta2: float = 0.95
     warmup_steps: int = 10 # Number of warmup steps for lr scheduler
     max_lr: float = 1e-3 # Maximum learning rate
-    num_epochs: int = 15 # Number of training steps
+    num_epochs: int = 10 # Number of training epochs
     batch_size: int = 16
     effective_batch_size: int = 2**15 # 32k (For gradient accumulation)
 

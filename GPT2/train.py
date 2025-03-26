@@ -32,7 +32,7 @@ optimizer = torch.optim.AdamW(
     )
 
 train_dataset = ShakespeareDataset(block_size=config.block_size, accelerator=accelerator)
-train_loader = DataLoader(train_dataset, batch_size=train_config.batch_size)
+train_loader = DataLoader(train_dataset, batch_size=train_config.batch_size, shuffle=True)
 grad_accum_steps = train_config.effective_batch_size // (train_config.batch_size * config.block_size * accelerator.num_processes)
 num_steps = train_config.num_epochs * len(train_loader) // (grad_accum_steps * accelerator.num_processes)
 scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_config.warmup_steps, num_training_steps=num_steps * 1.5)
